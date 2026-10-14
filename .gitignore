@@ -1,0 +1,14 @@
+.cache
+.claude
+
+build*/
+
+track.*
+
+# 自动生成的嵌入式前端资源
+embedded_web.c
+embedded_web.h
+
+# 前端构建产物
+dist
+node_modules
