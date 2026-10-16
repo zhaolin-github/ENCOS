@@ -1,14 +1,10 @@
-#include <arpa/inet.h>
-#include <netinet/in.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <unistd.h>
 
 #include "example_soem/motor_layer.h"
+#include "example_soem/net_compat.h"
 
 #define SERVER_PORT 5000
 #define MAX_PACKET_SIZE 512
@@ -57,20 +53,31 @@ static size_t parse_motor_batch(const uint8_t *buf, size_t len,
 
 int main(int argc, char **argv) {
   const char *bind_ip = (argc > 1) ? argv[1] : "0.0.0.0";
+  encos_socket_t sock;
 
-  int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-  if (sock < 0) {
-    perror("socket");
-    print_status(false, "UDP socket create failed");
+  if (!encos_net_startup()) {
+    encos_socket_error("network startup");
     return 1;
   }
 
-  int opt = 1;
-  if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-    perror("setsockopt");
-    close(sock);
-    print_status(false, "UDP socket set SO_REUSEADDR failed");
+  sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (sock == ENCOS_INVALID_SOCKET) {
+    encos_socket_error("socket");
+    print_status(false, "UDP socket create failed");
+    encos_net_cleanup();
     return 1;
+  }
+
+  {
+    int opt = 1;
+    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt,
+                   sizeof(opt)) < 0) {
+      encos_socket_error("setsockopt");
+      encos_close_socket(sock);
+      encos_net_cleanup();
+      print_status(false, "UDP socket set SO_REUSEADDR failed");
+      return 1;
+    }
   }
 
   struct sockaddr_in addr;
@@ -78,15 +85,17 @@ int main(int argc, char **argv) {
   addr.sin_family = AF_INET;
   if (inet_pton(AF_INET, bind_ip, &addr.sin_addr) != 1) {
     fprintf(stderr, "Invalid IP address: %s\n", bind_ip);
-    close(sock);
+    encos_close_socket(sock);
+    encos_net_cleanup();
     print_status(false, "Invalid UDP bind IP");
     return 1;
   }
   addr.sin_port = htons(SERVER_PORT);
 
   if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-    perror("bind");
-    close(sock);
+    encos_socket_error("bind");
+    encos_close_socket(sock);
+    encos_net_cleanup();
     print_status(false, "UDP bind failed");
     return 1;
   }
@@ -98,9 +107,9 @@ int main(int argc, char **argv) {
   while (1) {
     uint8_t raw[MAX_PACKET_SIZE] = {0};
     struct sockaddr_in client_addr;
-    socklen_t client_len = sizeof(client_addr);
-    ssize_t n = recvfrom(sock, raw, sizeof(raw), 0,
-                         (struct sockaddr *)&client_addr, &client_len);
+    encos_socklen_t client_len = sizeof(client_addr);
+    encos_ssize_t n = recvfrom(sock, (char *)raw, sizeof(raw), 0,
+                               (struct sockaddr *)&client_addr, &client_len);
     if (n <= 0) {
       continue;
     }
@@ -111,14 +120,15 @@ int main(int argc, char **argv) {
     RawMotorFrame frames[MAX_MOTORS] = {0};
     size_t count = parse_motor_batch(raw, (size_t)n, frames, MAX_MOTORS);
 
-    printf("\033[32m[OK]\033[0m UDP packet from %s:%d => %zu frame(s), %zd "
+    printf("\033[32m[OK]\033[0m UDP packet from %s:%d => %zu frame(s), %lld "
            "bytes\n",
-           ipbuf, ntohs(client_addr.sin_port), count, (size_t)n);
+           ipbuf, ntohs(client_addr.sin_port), count, (long long)n);
     for (size_t i = 0; i < count; ++i) {
       print_decoded_motor(&frames[i]);
     }
   }
 
-  close(sock);
+  encos_close_socket(sock);
+  encos_net_cleanup();
   return 0;
 }

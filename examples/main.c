@@ -3,13 +3,24 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 #include "example_soem/demo_timing.h"
 #include "example_soem/ethercat_layer.h"
 
 static const long kDemoCyclePeriodUs = 1000;
 static const int kDemoCycleCount = 5000;
+
+static void print_adapters(void) {
+  ec_adaptert *adapter = ec_find_adapters();
+  ec_adaptert *head = adapter;
+
+  printf("Available EtherCAT adapters:\n");
+  while (adapter != NULL) {
+    printf("  %s  (%s)\n", adapter->name, adapter->desc);
+    adapter = adapter->next;
+  }
+  ec_free_adapters(head);
+}
 
 /**
  * @brief 打印程序用法信息
@@ -18,6 +29,7 @@ static const int kDemoCycleCount = 5000;
 static void print_usage(const char *program) {
   fprintf(stderr,
           "Usage:\n"
+          "  %s --list-adapters\n"
           "  %s <ifname> <op> <slaveId> <busId> <slot> <motorId> <model> "
           "[--eff] [--canfd] [--flag <value>] [args...]\n"
           "\n"
@@ -35,7 +47,7 @@ static void print_usage(const char *program) {
           "\n"
           "Example:\n"
           "  sudo %s eth0 spd 0 0 0 1 2 1.0 2.0 1\n",
-          program, program);
+          program, program, program);
 }
 
 /**
@@ -162,6 +174,11 @@ static bool build_operation(int argc, char **argv, int arg_index,
  * @return 成功返回 0，参数错误返回 2，运行时错误返回 1
  */
 int main(int argc, char **argv) {
+  if (argc == 2 && strcmp(argv[1], "--list-adapters") == 0) {
+    print_adapters();
+    return 0;
+  }
+
   if (argc < 8) {
     print_usage(argv[0]);
     return 2;
@@ -199,8 +216,7 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  struct timespec next_cycle;
-  clock_gettime(CLOCK_MONOTONIC, &next_cycle);
+  DemoTimePoint next_cycle = demo_time_now();
   for (int i = 0; i < kDemoCycleCount; ++i) {
     (void)ec_master_cycle(&master);
     demo_wait_until_next_cycle(&next_cycle, kDemoCyclePeriodUs);

@@ -12,6 +12,45 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
+## Windows 10 x64 / Visual Studio 2017
+
+Windows 构建支持 Visual Studio 2017 x64。EtherCAT 使用 SOEM 的 Win32 后端和
+Npcap；Qt 界面在 Windows 上提供 UDP-CAN 和 TCP-TCP。SocketCAN 和
+`socketcan_8motor_simulator` 仅在 Linux 上构建。
+
+准备环境：
+
+1. 安装带有“使用 C++ 的桌面开发”工作负载的 Visual Studio 2017。
+2. 安装 CMake 3.14 或更高版本，并加入 `PATH`。
+3. 安装 Qt 5.12 的 `msvc2017_64` 套件。
+4. 安装 Npcap，并在安装器中选中 **Install Npcap in WinPcap API-compatible
+   Mode**。EtherCAT 运行时需要管理员权限。
+
+在 **x64 Native Tools Command Prompt for VS 2017** 中执行（按实际 Qt 路径修改）：
+
+```bat
+cd C:\path\to\ENCOS
+cmake -S . -B build-vs2017 -G "Visual Studio 15 2017" -A x64 ^
+  -DCMAKE_PREFIX_PATH=C:\Qt\5.12.12\msvc2017_64
+cmake --build build-vs2017 --config Release
+ctest --test-dir build-vs2017 -C Release --output-on-failure
+```
+
+运行 Qt 界面：
+
+```bat
+C:\Qt\5.12.12\msvc2017_64\bin\windeployqt.exe ^
+  build-vs2017\Release\qt_motor_control_ui.exe
+build-vs2017\Release\qt_motor_control_ui.exe
+```
+
+运行 EtherCAT demo 时，Windows 网卡参数不是 Linux 的 `eth0`，而是 Npcap
+设备名称。先列出可用接口，再把第一列完整复制为 `<ifname>`：
+
+```bat
+build-vs2017\Release\example_soem_demo.exe --list-adapters
+```
+
 ## 运行权限
 
 可以使用 root 运行：
@@ -99,3 +138,12 @@ cmake --build build --target socketcan_8motor_simulator qt_motor_control_ui
 ```bash
 ./build/socketcan_8motor_simulator vcan0 --current-range 30 --print-ms 1000
 ```
+
+Qt 界面方向键中央的 **Calibration** 按钮会先暂停周期控制报文，然后发送参数查询：
+
+- CAN `1/3/5/7`：`E1 02`，读取当前速度（RPM）
+- CAN `2/4/6/8`：`E1 01`，读取当前位置（度）
+
+界面解析类型 5 应答 `A0 <查询代码> <float32 big-endian>`，将结果写入对应的四个速度和
+四个位置输入框，再重新生成八个控制报文。`socketcan_8motor_simulator` 同样支持这些查询，
+可用于验证校准流程。

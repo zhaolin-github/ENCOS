@@ -38,12 +38,14 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#ifdef Q_OS_LINUX
 #include <linux/can.h>
 #include <linux/can/raw.h>
 #include <net/if.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#endif
 
 extern "C" {
 #include "example_soem/motor_layer.h"
@@ -272,6 +274,7 @@ public:
           feedbackTimer_(new QTimer(this)),
           autoSendTimer_(new QTimer(this)),
           networkCheckTimer_(new QTimer(this)),
+          calibrationTimer_(new QTimer(this)),
           udpSocket_(new QUdpSocket(this)),
           tcpSocket_(new QTcpSocket(this)),
           canSocket_(-1) {
@@ -284,6 +287,9 @@ public:
         connect(feedbackTimer_, &QTimer::timeout, this, &MotorControlWindow::onFeedbackRefreshTick);
         connect(autoSendTimer_, &QTimer::timeout, this, &MotorControlWindow::onAutoSendTick);
         connect(networkCheckTimer_, &QTimer::timeout, this, &MotorControlWindow::onNetworkCheck);
+        calibrationTimer_->setSingleShot(true);
+        connect(calibrationTimer_, &QTimer::timeout, this,
+                &MotorControlWindow::onCalibrationTimeout);
         connect(udpSocket_, &QUdpSocket::readyRead, this, &MotorControlWindow::onUdpReadyRead);
         connect(tcpSocket_, &QTcpSocket::readyRead, this, &MotorControlWindow::onTcpReadyRead);
         frameTimer_->start(500);
@@ -297,6 +303,11 @@ public:
 private slots:
     void onSendClicked() {
         sendCurrentFrame();
+    }
+
+    void onStopSendingClicked() {
+        autoSendTimer_->stop();
+        calibrationResumeAutoSend_ = false;
     }
 
     void onSelectAllClicked() {
@@ -323,41 +334,6 @@ private slots:
             }
             applyMotorRowVisualState(i, "idle");
         }
-        updateFramePreview();
-    }
-
-    void onForwardClicked() {
-        const std::array<std::array<uint8_t, 7>, 4> forwardPayloads = {{
-            {{0x41, 0xBF, 0x80, 0x00, 0x00, 0x00, 0x64}},
-            {{0x41, 0xBF, 0x80, 0x00, 0x00, 0x00, 0x64}},
-            {{0x41, 0x3F, 0x80, 0x00, 0x00, 0x00, 0x64}},
-            {{0x41, 0x3F, 0x80, 0x00, 0x00, 0x00, 0x64}},
-        }};
-        int payloadIndex = 0;
-
-        for (int row = 0; row < motorList_.size(); ++row) {
-            const bool forwardMotor = (row % 2 == 0);
-            motorList_[row].enabled = forwardMotor;
-            if (auto* enableBox = qobject_cast<QCheckBox*>(motorMatrix_->cellWidget(row, 0))) {
-                enableBox->setChecked(forwardMotor);
-            }
-
-            if (!forwardMotor) {
-                continue;
-            }
-
-            if (auto* command = qobject_cast<QComboBox*>(motorMatrix_->cellWidget(row, 3))) {
-                command->setCurrentText("spd");
-            }
-            motorList_[row].commandName = "spd";
-            motorList_[row].rawData.fill(0);
-            const auto& payload = forwardPayloads[static_cast<size_t>(payloadIndex++)];
-            std::copy(payload.begin(), payload.end(), motorList_[row].rawData.begin());
-            motorList_[row].rawDataLen = static_cast<int>(payload.size());
-            motorList_[row].rawPayloadManual = true;
-            refreshHexByteEditorsForRow(row);
-        }
-
         updateFramePreview();
     }
 
@@ -448,6 +424,102 @@ private slots:
         onSetDirectionClicked();
     }
 
+    void onCalibrationClicked() {
+        if (!networkConnected_) {
+            if (transportCombo_->currentData().toInt() ==
+                    static_cast<int>(TransportMode::CanSocketCan) &&
+                !applySocketCanBitrate()) {
+                QMessageBox::warning(
+                    this, "Calibration",
+                    QString("Could not prepare SocketCAN interface %1.")
+                        .arg(canInterfaceEdit_->text().trimmed()));
+                return;
+            }
+            if (!probeNetwork()) {
+                QMessageBox::warning(this, "Calibration",
+                                     "Could not connect the selected transport.");
+                return;
+            }
+            networkConnected_ = true;
+            setNetworkStatus(true, "CONNECTED");
+            connectButton_->setChecked(true);
+            connectButton_->setText("Disconnect Network");
+        } else if (!probeNetwork()) {
+            QMessageBox::warning(this, "Calibration",
+                                 "The selected transport is no longer connected.");
+            return;
+        }
+
+        calibrationResumeAutoSend_ = autoSendTimer_->isActive();
+        autoSendTimer_->stop();
+        calibrationPending_.fill(true);
+        calibrationActive_ = true;
+        calibrationButton_->setEnabled(false);
+        calibrationButton_->setText("Reading...");
+
+        std::array<MotorPackMsg, 8> queries{};
+        QByteArray payload;
+        for (int motorId = 1; motorId <= 8; ++motorId) {
+            MotorConfig config = motor_config_make(
+                1, 0, static_cast<uint16_t>(motorId), MOTOR_MODEL_EC_A2806_P2);
+            const MotorParameter parameter = ((motorId % 2) != 0)
+                                                 ? MOTOR_PARAM_SPEED
+                                                 : MOTOR_PARAM_POSITION;
+            if (!motor_build_get_parameter(
+                    &config, parameter, &queries[static_cast<size_t>(motorId - 1)])) {
+                finishCalibration(false, "Failed to build query frames.");
+                return;
+            }
+            payload.append(
+                reinterpret_cast<const char*>(&queries[static_cast<size_t>(motorId - 1)]),
+                static_cast<int>(sizeof(MotorPackMsg)));
+        }
+
+        bool sent = false;
+        const int transport = transportCombo_->currentData().toInt();
+        if (transport == static_cast<int>(TransportMode::CanSocketCan)) {
+            int sentCount = 0;
+            sent = true;
+            for (const MotorPackMsg& query : queries) {
+                if (!sendCanFrame(query, sentCount)) {
+                    sent = false;
+                    break;
+                }
+            }
+        } else if (transport == static_cast<int>(TransportMode::UdpCan)) {
+            const qint64 count = udpSocket_->writeDatagram(
+                payload, QHostAddress(hostEdit_->text()), portEdit_->value());
+            sent = count == payload.size();
+        } else {
+            if (tcpSocket_->state() != QAbstractSocket::ConnectedState) {
+                tcpSocket_->connectToHost(hostEdit_->text(), portEdit_->value());
+            }
+            if (tcpSocket_->state() == QAbstractSocket::ConnectedState ||
+                tcpSocket_->waitForConnected(1000)) {
+                const qint64 count = tcpSocket_->write(payload);
+                sent = count == payload.size() && tcpSocket_->waitForBytesWritten(1000);
+            }
+        }
+
+        if (!sent) {
+            finishCalibration(false, "Failed to send the eight query frames.");
+            return;
+        }
+
+        calibrationTimer_->start(1500);
+    }
+
+    void onCalibrationTimeout() {
+        QStringList missing;
+        for (size_t index = 0; index < calibrationPending_.size(); ++index) {
+            if (calibrationPending_[index]) {
+                missing << QString::number(index + 1);
+            }
+        }
+        finishCalibration(false,
+                          QString("No query response from CAN %1.").arg(missing.join(", ")));
+    }
+
     void onStopClicked() {
         for (int row = 0; row < motorList_.size(); ++row) {
             MotorEntry& motor = motorList_[row];
@@ -521,6 +593,7 @@ private slots:
     }
 
     void onCanReadyRead() {
+#ifdef Q_OS_LINUX
         while (true) {
             struct can_frame frame{};
             const ssize_t bytesRead =
@@ -549,6 +622,7 @@ private slots:
             std::memcpy(packet.data, frame.data, packet.len);
             updateFeedbackFromPacket(packet);
         }
+#endif
     }
 
 private:
@@ -704,7 +778,9 @@ private:
         transportCombo_ = new QComboBox(this);
         transportCombo_->addItem("UDP-CAN", static_cast<int>(TransportMode::UdpCan));
         transportCombo_->addItem("TCP-TCP", static_cast<int>(TransportMode::TcpTcp));
+#ifdef Q_OS_LINUX
         transportCombo_->addItem("SocketCAN", static_cast<int>(TransportMode::CanSocketCan));
+#endif
         transportLayout->addRow("Path:", transportCombo_);
 
         hostEdit_ = new QLineEdit("192.168.1.50", this);
@@ -783,16 +859,10 @@ private:
         auto* matrixButtons = new QWidget(this);
         auto* matrixButtonLayout = new QHBoxLayout(matrixButtons);
         auto* selectAllButton = new QPushButton("Select All", this);
-        auto* forwardButton = new QPushButton("Forward", this);
-        auto* stopButton = new QPushButton("Stop", this);
         auto* clearAllButton = new QPushButton("Clear All", this);
         matrixButtonLayout->addWidget(selectAllButton);
-        matrixButtonLayout->addWidget(forwardButton);
-        matrixButtonLayout->addWidget(stopButton);
         matrixButtonLayout->addWidget(clearAllButton);
         connect(selectAllButton, &QPushButton::clicked, this, &MotorControlWindow::onSelectAllClicked);
-        connect(forwardButton, &QPushButton::clicked, this, &MotorControlWindow::onForwardClicked);
-        connect(stopButton, &QPushButton::clicked, this, &MotorControlWindow::onStopClicked);
         connect(clearAllButton, &QPushButton::clicked, this, &MotorControlWindow::onClearAllClicked);
         commandLayout->addWidget(matrixButtons);
 
@@ -823,7 +893,8 @@ private:
         commandLayout->addWidget(directionControls);
 
         auto* speedControls = new QWidget(this);
-        auto* speedLayout = new QHBoxLayout(speedControls);
+        auto* speedLayout = new QVBoxLayout(speedControls);
+        auto* speedRowLayout = new QHBoxLayout();
         auto* speedGrid = new QGridLayout();
         const auto createSpeedEditor = [this](int canId, QDoubleSpinBox*& editor) {
             auto* field = new QWidget(this);
@@ -841,11 +912,23 @@ private:
         speedGrid->addWidget(createSpeedEditor(1, speedCan1Edit_), 0, 1);
         speedGrid->addWidget(createSpeedEditor(5, speedCan5Edit_), 1, 0);
         speedGrid->addWidget(createSpeedEditor(3, speedCan3Edit_), 1, 1);
-        speedLayout->addLayout(speedGrid, 1);
+        speedRowLayout->addLayout(speedGrid, 1);
 
         auto* setSpeedButton = new QPushButton("Set Speed", this);
-        speedLayout->addWidget(setSpeedButton);
+        speedRowLayout->addWidget(setSpeedButton);
         connect(setSpeedButton, &QPushButton::clicked, this, &MotorControlWindow::onSetSpeedClicked);
+        speedLayout->addLayout(speedRowLayout);
+
+        auto* calibrationDirectionLayout = new QHBoxLayout();
+
+        calibrationButton_ = new QToolButton(speedControls);
+        calibrationButton_->setText("Calibration");
+        calibrationButton_->setFixedSize(86, 38);
+        calibrationButton_->setToolTip(
+            "Read current speed from CAN 1/3/5/7 and position from CAN 2/4/6/8");
+        calibrationDirectionLayout->addWidget(calibrationButton_, 1, Qt::AlignCenter);
+        connect(calibrationButton_, &QToolButton::clicked, this,
+                &MotorControlWindow::onCalibrationClicked);
 
         auto* dpad = new QWidget(this);
         auto* dpadLayout = new QGridLayout(dpad);
@@ -867,22 +950,44 @@ private:
         dpadLayout->addWidget(arrowLeftButton, 1, 0);
         dpadLayout->addWidget(arrowRightButton, 1, 2);
         dpadLayout->addWidget(arrowDownButton, 2, 1);
-        speedLayout->addWidget(dpad);
+        calibrationDirectionLayout->addWidget(dpad, 1, Qt::AlignCenter);
+        auto* emergencyStopButton = new QPushButton("Emergency Stop", speedControls);
+        emergencyStopButton->setMinimumHeight(38);
+        emergencyStopButton->setToolTip("Set all eight motors to the stop command");
+        emergencyStopButton->setStyleSheet(
+            "QPushButton { background-color: #d32f2f; color: white; font-weight: bold; "
+            "border: 1px solid #a80000; border-radius: 4px; padding: 6px 12px; }"
+            "QPushButton:hover { background-color: #e53935; }"
+            "QPushButton:pressed { background-color: #b71c1c; }");
+        calibrationDirectionLayout->addWidget(emergencyStopButton, 1, Qt::AlignCenter);
+        speedLayout->addLayout(calibrationDirectionLayout);
         connect(arrowUpButton, &QToolButton::clicked, this, &MotorControlWindow::onArrowUpClicked);
         connect(arrowDownButton, &QToolButton::clicked, this, &MotorControlWindow::onArrowDownClicked);
         connect(arrowLeftButton, &QToolButton::clicked, this, &MotorControlWindow::onArrowLeftClicked);
         connect(arrowRightButton, &QToolButton::clicked, this, &MotorControlWindow::onArrowRightClicked);
+        connect(emergencyStopButton, &QPushButton::clicked, this,
+                &MotorControlWindow::onStopClicked);
         commandLayout->addWidget(speedControls);
 
-        sendButton_ = new QPushButton("Send Enabled Motors", this);
+        auto* sendControls = new QWidget(this);
+        auto* sendControlsLayout = new QHBoxLayout(sendControls);
+        sendControlsLayout->setContentsMargins(0, 0, 0, 0);
+        sendButton_ = new QPushButton("Send Enabled Motors", sendControls);
+        auto* stopSendingButton = new QPushButton("Stop Sending", sendControls);
+        stopSendingButton->setToolTip(
+            "Stop periodic motor data transmission without disconnecting the network");
+        sendControlsLayout->addWidget(sendButton_);
+        sendControlsLayout->addWidget(stopSendingButton);
         saveButton_ = new QPushButton("Save feedback log", this);
         leftLayout->addWidget(transportGroup);
         leftLayout->addWidget(commandGroup);
-        leftLayout->addWidget(sendButton_);
+        leftLayout->addWidget(sendControls);
         leftLayout->addWidget(saveButton_);
         leftLayout->addStretch();
 
         connect(sendButton_, &QPushButton::clicked, this, &MotorControlWindow::onSendClicked);
+        connect(stopSendingButton, &QPushButton::clicked, this,
+                &MotorControlWindow::onStopSendingClicked);
         connect(saveButton_, &QPushButton::clicked, this, &MotorControlWindow::onSaveFeedbackClicked);
 
         rightPanel_ = new QWidget(this);
@@ -1025,6 +1130,9 @@ private:
     }
 
     void updateFeedbackFromPacket(const MotorPackMsg& packet) {
+        if (processCalibrationResponse(packet)) {
+            return;
+        }
         if (packet.id < 1 || packet.id > static_cast<uint32_t>(motorList_.size()) || packet.len < 8) {
             return;
         }
@@ -1044,6 +1152,104 @@ private:
         state.decoded = decoded;
         state.receivedAt = QDateTime::currentDateTime();
         state.received = true;
+    }
+
+    QDoubleSpinBox* calibrationEditor(int motorId) const {
+        switch (motorId) {
+            case 1:
+                return speedCan1Edit_;
+            case 2:
+                return positionCan2Edit_;
+            case 3:
+                return speedCan3Edit_;
+            case 4:
+                return positionCan4Edit_;
+            case 5:
+                return speedCan5Edit_;
+            case 6:
+                return positionCan6Edit_;
+            case 7:
+                return speedCan7Edit_;
+            case 8:
+                return positionCan8Edit_;
+            default:
+                return nullptr;
+        }
+    }
+
+    bool processCalibrationResponse(const MotorPackMsg& packet) {
+        if (packet.len < 2 || (packet.data[0] >> 5) != 5) {
+            return false;
+        }
+        if (!calibrationActive_ || packet.id < 1 || packet.id > 8) {
+            return true;
+        }
+
+        const uint8_t responseError = static_cast<uint8_t>(packet.data[0] & 0x1F);
+        if (responseError != 0) {
+            finishCalibration(false,
+                              QString("CAN %1 rejected the query (error %2).")
+                                  .arg(packet.id)
+                                  .arg(responseError));
+            return true;
+        }
+
+        MotorQueryFeedbackFloat feedback{};
+        if (!motor_decode_query_feedback_float(&packet, &feedback)) {
+            return true;
+        }
+
+        const int motorId = static_cast<int>(packet.id);
+        const uint8_t expectedCode = ((motorId % 2) != 0)
+                                         ? static_cast<uint8_t>(MOTOR_PARAM_SPEED)
+                                         : static_cast<uint8_t>(MOTOR_PARAM_POSITION);
+        if (feedback.query_code != expectedCode ||
+            !calibrationPending_[static_cast<size_t>(motorId - 1)]) {
+            return true;
+        }
+        if (feedback.error != 0 || !std::isfinite(feedback.value)) {
+            finishCalibration(false,
+                              QString("CAN %1 returned an invalid query response (error %2).")
+                                  .arg(motorId)
+                                  .arg(feedback.error));
+            return true;
+        }
+
+        QDoubleSpinBox* editor = calibrationEditor(motorId);
+        if (!editor) {
+            return true;
+        }
+        editor->setValue(feedback.value);
+        calibrationPending_[static_cast<size_t>(motorId - 1)] = false;
+
+        if (std::none_of(calibrationPending_.begin(), calibrationPending_.end(),
+                         [](bool pending) { return pending; })) {
+            onSetSpeedClicked();
+            onSetDirectionClicked();
+            finishCalibration(true, "All eight motor values were calibrated.");
+        }
+        return true;
+    }
+
+    void finishCalibration(bool success, const QString& message) {
+        if (!calibrationActive_) {
+            return;
+        }
+
+        calibrationTimer_->stop();
+        calibrationActive_ = false;
+        calibrationButton_->setEnabled(true);
+        calibrationButton_->setText("Calibration");
+        if (calibrationResumeAutoSend_ && networkConnected_) {
+            autoSendTimer_->start(currentSendIntervalMs());
+        }
+        calibrationResumeAutoSend_ = false;
+
+        if (success) {
+            QMessageBox::information(this, "Calibration", message);
+        } else {
+            QMessageBox::warning(this, "Calibration", message);
+        }
     }
 
     void refreshLocalAddressInfo() {
@@ -1076,6 +1282,7 @@ private:
     }
 
     bool sendCanFrame(const MotorPackMsg& packet, int& sentCount) {
+#ifdef Q_OS_LINUX
         if (!ensureCanSocketOpen()) {
             return false;
         }
@@ -1100,9 +1307,18 @@ private:
         }
         sentCount += 1;
         return true;
+#else
+        Q_UNUSED(packet);
+        Q_UNUSED(sentCount);
+        return false;
+#endif
     }
 
     void sendCurrentFrame() {
+        if (calibrationActive_) {
+            return;
+        }
+
         QByteArray payload;
         QList<int> successfulRows;
 
@@ -1276,6 +1492,7 @@ private:
     }
 
     bool ensureCanSocketOpen() {
+#ifdef Q_OS_LINUX
         if (canSocket_ >= 0) {
             return true;
         }
@@ -1304,6 +1521,9 @@ private:
         canReadNotifier_ = new QSocketNotifier(canSocket_, QSocketNotifier::Read, this);
         connect(canReadNotifier_, SIGNAL(activated(int)), this, SLOT(onCanReadyRead()));
         return true;
+#else
+        return false;
+#endif
     }
 
     void closeCanSocket() {
@@ -1313,12 +1533,15 @@ private:
             canReadNotifier_ = nullptr;
         }
         if (canSocket_ >= 0) {
+#ifdef Q_OS_LINUX
             ::close(canSocket_);
+#endif
             canSocket_ = -1;
         }
     }
 
     bool applySocketCanBitrate() {
+#ifdef Q_OS_LINUX
         const QString iface = canInterfaceEdit_->text().trimmed();
         const QString bitrateText = canBitrateEdit_->text().trimmed();
         if (iface.isEmpty() || bitrateText.isEmpty()) {
@@ -1350,6 +1573,9 @@ private:
         }
 
         return true;
+#else
+        return false;
+#endif
     }
 
     void onCanBitrateSetClicked() {
@@ -1380,7 +1606,6 @@ private:
                 networkConnected_ = true;
                 setNetworkStatus(true, "CONNECTED");
                 connectButton_->setText("Disconnect Network");
-                autoSendTimer_->start(currentSendIntervalMs());
             } else {
                 networkConnected_ = false;
                 setNetworkStatus(false, "FAILED");
@@ -1473,12 +1698,17 @@ private:
     QTimer* feedbackTimer_ = nullptr;
     QTimer* autoSendTimer_ = nullptr;
     QTimer* networkCheckTimer_ = nullptr;
+    QTimer* calibrationTimer_ = nullptr;
     QUdpSocket* udpSocket_ = nullptr;
     QTcpSocket* tcpSocket_ = nullptr;
     QSocketNotifier* canReadNotifier_ = nullptr;
+    QToolButton* calibrationButton_ = nullptr;
     QByteArray tcpReceiveBuffer_;
+    std::array<bool, 8> calibrationPending_{};
     int canSocket_ = -1;
     bool networkConnected_ = false;
+    bool calibrationActive_ = false;
+    bool calibrationResumeAutoSend_ = false;
 };
 
 int main(int argc, char** argv) {

@@ -1,9 +1,4 @@
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
-
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <iomanip>
@@ -12,11 +7,27 @@
 #include <string>
 #include <vector>
 
+#include "example_soem/net_compat.h"
+
 extern "C" {
 #include "example_soem/motor_layer.h"
 }
 
 namespace {
+
+class NetworkRuntime {
+public:
+    NetworkRuntime() : ready_(encos_net_startup() != 0) {}
+    ~NetworkRuntime() {
+        if (ready_) {
+            encos_net_cleanup();
+        }
+    }
+    bool ready() const { return ready_; }
+
+private:
+    bool ready_;
+};
 
 struct TcpCanFrame {
     uint32_t can_id = 0;
@@ -168,7 +179,7 @@ public:
         close();
 
         fd_ = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        if (fd_ < 0) {
+        if (fd_ == ENCOS_INVALID_SOCKET) {
             return false;
         }
 
@@ -187,10 +198,7 @@ public:
             return false;
         }
 
-        struct timeval timeout {
-            1, 0
-        };
-        if (setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+        if (encos_set_receive_timeout(fd_, 1000) < 0) {
             close();
             return false;
         }
@@ -200,13 +208,14 @@ public:
 
     bool sendFrame(const MotorPackMsg& packet) {
         const auto encoded = encodeToGatewayFrame(packet);
-        const ssize_t n = ::send(fd_, encoded.data(), static_cast<size_t>(encoded.size()), 0);
-        return n == static_cast<ssize_t>(encoded.size());
+        const encos_ssize_t n = ::send(fd_, reinterpret_cast<const char*>(encoded.data()),
+                                       static_cast<int>(encoded.size()), 0);
+        return n == static_cast<encos_ssize_t>(encoded.size());
     }
 
     bool recvFrame(MotorPackMsg& packet) {
         uint8_t raw[64] = {0};
-        const ssize_t n = ::recv(fd_, raw, sizeof(raw), 0);
+        const encos_ssize_t n = ::recv(fd_, reinterpret_cast<char*>(raw), sizeof(raw), 0);
         if (n <= 0) {
             return false;
         }
@@ -216,14 +225,14 @@ public:
     }
 
     void close() {
-        if (fd_ >= 0) {
-            ::close(fd_);
-            fd_ = -1;
+        if (fd_ != ENCOS_INVALID_SOCKET) {
+            encos_close_socket(fd_);
+            fd_ = ENCOS_INVALID_SOCKET;
         }
     }
 
 private:
-    int fd_ = -1;
+    encos_socket_t fd_ = ENCOS_INVALID_SOCKET;
     sockaddr_in remote_addr_{};
 };
 
@@ -236,7 +245,7 @@ public:
         close();
 
         fd_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (fd_ < 0) {
+        if (fd_ == ENCOS_INVALID_SOCKET) {
             return false;
         }
 
@@ -253,10 +262,7 @@ public:
             return false;
         }
 
-        struct timeval timeout {
-            1, 0
-        };
-        if (setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+        if (encos_set_receive_timeout(fd_, 1000) < 0) {
             close();
             return false;
         }
@@ -268,7 +274,9 @@ public:
         const auto encoded = encodeToGatewayFrame(packet);
         size_t sent = 0;
         while (sent < encoded.size()) {
-            const ssize_t n = ::send(fd_, encoded.data() + sent, encoded.size() - sent, 0);
+            const encos_ssize_t n = ::send(
+                fd_, reinterpret_cast<const char*>(encoded.data() + sent),
+                static_cast<int>(encoded.size() - sent), 0);
             if (n <= 0) {
                 return false;
             }
@@ -279,7 +287,7 @@ public:
 
     bool recvFrame(MotorPackMsg& packet) {
         uint8_t raw[64] = {0};
-        const ssize_t n = ::recv(fd_, raw, sizeof(raw), 0);
+        const encos_ssize_t n = ::recv(fd_, reinterpret_cast<char*>(raw), sizeof(raw), 0);
         if (n <= 0) {
             return false;
         }
@@ -289,14 +297,14 @@ public:
     }
 
     void close() {
-        if (fd_ >= 0) {
-            ::close(fd_);
-            fd_ = -1;
+        if (fd_ != ENCOS_INVALID_SOCKET) {
+            encos_close_socket(fd_);
+            fd_ = ENCOS_INVALID_SOCKET;
         }
     }
 
 private:
-    int fd_ = -1;
+    encos_socket_t fd_ = ENCOS_INVALID_SOCKET;
 };
 
 bool sendFrameByTransport(TransportMode mode, const std::string& host, int port,
@@ -414,6 +422,12 @@ int main(int argc, char** argv) {
     if (argc < 8) {
         printUsage(argv[0]);
         return 2;
+    }
+
+    NetworkRuntime network;
+    if (!network.ready()) {
+        encos_socket_error("network startup");
+        return 1;
     }
 
     try {

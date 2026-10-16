@@ -101,8 +101,32 @@ static int test_motor_encoding(void) {
   CHECK(motor_build_get_parameter(&config, MOTOR_PARAM_ACCELERATION, &packet));
   CHECK(packet.id == 1);
   CHECK(packet.len == 2);
-  CHECK(packet.data[0] == (uint8_t)(0x07 << 5));
+  CHECK(packet.data[0] == (uint8_t)((0x07 << 5) | 1));
   CHECK(packet.data[1] == MOTOR_PARAM_ACCELERATION);
+  return 0;
+}
+
+static int test_decode_query_feedback_float(void) {
+  MotorPackMsg packet = {0};
+  MotorQueryFeedbackFloat feedback = {0};
+
+  packet.id = 1;
+  packet.len = 6;
+  packet.data[0] = 0xA0;
+  packet.data[1] = MOTOR_PARAM_SPEED;
+  packet.data[2] = 0x42;
+  packet.data[3] = 0x06;
+  packet.data[4] = 0x66;
+  packet.data[5] = 0x66;
+
+  CHECK(motor_decode_query_feedback_float(&packet, &feedback));
+  CHECK(feedback.message_type == 5);
+  CHECK(feedback.error == 0);
+  CHECK(feedback.query_code == MOTOR_PARAM_SPEED);
+  CHECK(fabsf(feedback.value - 33.6f) < 0.0001f);
+
+  packet.len = 5;
+  CHECK(!motor_decode_query_feedback_float(&packet, &feedback));
   return 0;
 }
 
@@ -152,13 +176,12 @@ static int test_decode_feedback1(void) {
   return 0;
 }
 
-static int test_timespec_add_us_normalizes_nsec(void) {
-  struct timespec point = {.tv_sec = 3, .tv_nsec = 999900000L};
+static int test_time_add_us(void) {
+  DemoTimePoint point = {3999900000LL};
 
-  demo_timespec_add_us(&point, 250);
+  demo_time_add_us(&point, 250);
 
-  CHECK(point.tv_sec == 4);
-  CHECK(point.tv_nsec == 150000L);
+  CHECK(point.nanoseconds == 4000150000LL);
   return 0;
 }
 
@@ -168,8 +191,9 @@ int main(void) {
   CHECK(test_validate_and_offset() == 0);
   CHECK(test_write_packet_offset() == 0);
   CHECK(test_motor_encoding() == 0);
+  CHECK(test_decode_query_feedback_float() == 0);
   CHECK(test_motor_config_flags() == 0);
   CHECK(test_decode_feedback1() == 0);
-  CHECK(test_timespec_add_us_normalizes_nsec() == 0);
+  CHECK(test_time_add_us() == 0);
   return 0;
 }

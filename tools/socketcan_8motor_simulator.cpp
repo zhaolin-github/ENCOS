@@ -167,6 +167,15 @@ float readFloatBe(const uint8_t *data) {
   return value;
 }
 
+void writeFloatBe(uint8_t *data, float value) {
+  uint32_t bits = 0;
+  std::memcpy(&bits, &value, sizeof(bits));
+  data[0] = static_cast<uint8_t>(bits >> 24);
+  data[1] = static_cast<uint8_t>(bits >> 16);
+  data[2] = static_cast<uint8_t>(bits >> 8);
+  data[3] = static_cast<uint8_t>(bits);
+}
+
 float readPackedPositionDegrees(const can_frame &frame) {
   uint64_t packed = 0;
   for (int index = 0; index < 8; ++index) {
@@ -206,6 +215,31 @@ can_frame buildFeedbackFrame(int motorId, const MotorState &state,
   ack.data[6] = encodeTemperature(state.motorTemperatureC);
   ack.data[7] = encodeTemperature(state.mosTemperatureC);
   return ack;
+}
+
+bool buildQueryFeedbackFrame(int motorId, const can_frame &query,
+                             const MotorState &state, can_frame &ack) {
+  if (query.can_dlc != 2 || (query.data[0] >> 5) != 7) {
+    return false;
+  }
+
+  const uint8_t queryCode = query.data[1];
+  float value = 0.0F;
+  if (queryCode == MOTOR_PARAM_POSITION) {
+    value = state.positionRad * 180.0F / kPi;
+  } else if (queryCode == MOTOR_PARAM_SPEED) {
+    value = state.speedRadS * 30.0F / kPi;
+  } else {
+    return false;
+  }
+
+  ack = can_frame{};
+  ack.can_id = static_cast<canid_t>(motorId);
+  ack.can_dlc = 6;
+  ack.data[0] = 0xA0; // Feedback type 5, error 0.
+  ack.data[1] = queryCode;
+  writeFloatBe(ack.data + 2, value);
+  return true;
 }
 
 bool decodeCommand(const can_frame &frame, MotorState &state,
@@ -412,12 +446,17 @@ int main(int argc, char **argv) {
         const int motorId = static_cast<int>(command.can_id & CAN_SFF_MASK);
         if (motorId >= 1 && motorId <= kMotorCount) {
           MotorState &state = motors[static_cast<size_t>(motorId - 1)];
-          if (decodeCommand(command, state, options)) {
+          can_frame ack{};
+          const bool queryHandled =
+              buildQueryFeedbackFrame(motorId, command, state, ack);
+          if (queryHandled || decodeCommand(command, state, options)) {
             state.seen = true;
             state.lastCommand = command;
+            state.lastCommandTime = std::chrono::steady_clock::now();
             ++state.receivedCount;
-            const can_frame ack =
-                buildFeedbackFrame(motorId, state, options.currentRangeA);
+            if (!queryHandled) {
+              ack = buildFeedbackFrame(motorId, state, options.currentRangeA);
+            }
             const ssize_t written = write(socketFd, &ack, sizeof(ack));
             if (written == static_cast<ssize_t>(sizeof(ack))) {
               state.lastAck = ack;

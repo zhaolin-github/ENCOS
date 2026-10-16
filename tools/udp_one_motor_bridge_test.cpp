@@ -1,7 +1,3 @@
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -9,6 +5,8 @@
 #include <iostream>
 #include <string>
 #include <vector>
+
+#include "example_soem/net_compat.h"
 
 extern "C" {
 #include "example_soem/motor_layer.h"
@@ -130,9 +128,15 @@ int main(int argc, char** argv) {
     std::cout << "UDP payload bytes: ";
     printHex(payload);
 
-    const int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock < 0) {
-        perror("socket");
+    if (!encos_net_startup()) {
+        encos_socket_error("network startup");
+        return 4;
+    }
+
+    const encos_socket_t sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock == ENCOS_INVALID_SOCKET) {
+        encos_socket_error("socket");
+        encos_net_cleanup();
         return 4;
     }
 
@@ -142,19 +146,24 @@ int main(int argc, char** argv) {
     addr.sin_port = htons(static_cast<uint16_t>(port));
     if (inet_pton(AF_INET, targetIp.c_str(), &addr.sin_addr) != 1) {
         std::cerr << "Invalid target IP: " << targetIp << '\n';
-        close(sock);
+        encos_close_socket(sock);
+        encos_net_cleanup();
         return 5;
     }
 
-    const ssize_t sent = sendto(sock, payload.data(), payload.size(), 0,
-                               reinterpret_cast<const sockaddr*>(&addr), sizeof(addr));
+    const encos_ssize_t sent =
+        sendto(sock, reinterpret_cast<const char*>(payload.data()),
+               static_cast<int>(payload.size()), 0,
+               reinterpret_cast<const sockaddr*>(&addr), sizeof(addr));
     if (sent < 0) {
-        perror("sendto");
-        close(sock);
+        encos_socket_error("sendto");
+        encos_close_socket(sock);
+        encos_net_cleanup();
         return 6;
     }
 
     std::cout << "Sent " << sent << " bytes to UDP bridge.\n";
-    close(sock);
+    encos_close_socket(sock);
+    encos_net_cleanup();
     return 0;
 }

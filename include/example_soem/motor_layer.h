@@ -161,6 +161,14 @@ typedef struct {
   float mos_temperature_c;   /**< MOS 温度，单位摄氏度 */
 } MotorFeedback1;
 
+/** @brief 类型 5 查询应答中的 float32 数据 */
+typedef struct {
+  uint8_t message_type; /**< 报文类型，应为 5 */
+  uint8_t error;        /**< 电机错误信息 */
+  uint8_t query_code;   /**< 查询代码 */
+  float value;          /**< big-endian IEEE-754 float32 查询值 */
+} MotorQueryFeedbackFloat;
+
 /** @brief CAN 帧标志位 */
 enum {
   MOTOR_CAN_FLAG_EFF = 0x01,     /**< 扩展帧标志 */
@@ -503,6 +511,15 @@ bool motor_build_get_parameter(const MotorConfig *config,
  */
 bool motor_decode_feedback1(const MotorPackMsg *packet, float current_range,
                             MotorFeedback1 *feedback);
+
+/**
+ * @brief 解码类型 5 的 float32 查询应答
+ * @param[in] packet 接收到的 6 字节查询应答
+ * @param[out] feedback 解码后的错误码、查询代码和 float32 数值
+ * @return 解码成功返回 true，报文无效或类型不是 5 返回 false
+ */
+bool motor_decode_query_feedback_float(const MotorPackMsg *packet,
+                                       MotorQueryFeedbackFloat *feedback);
 
 /**
  * @brief 打印接收到的电机报文

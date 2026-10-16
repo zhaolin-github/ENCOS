@@ -1,14 +1,10 @@
-#include <arpa/inet.h>
-#include <netinet/in.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <unistd.h>
 
 #include "example_soem/motor_layer.h"
+#include "example_soem/net_compat.h"
 
 #define SERVER_PORT 6000
 #define MAX_PACKET_SIZE 256
@@ -66,20 +62,31 @@ static size_t parse_motor_batch(const uint8_t *buf, size_t len,
 
 int main(int argc, char **argv) {
   const char *bind_ip = (argc > 1) ? argv[1] : "0.0.0.0";
+  encos_socket_t server_fd;
 
-  int server_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-  if (server_fd < 0) {
-    perror("socket");
-    print_status(false, "TCP socket create failed");
+  if (!encos_net_startup()) {
+    encos_socket_error("network startup");
     return 1;
   }
 
-  int opt = 1;
-  if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-    perror("setsockopt");
-    close(server_fd);
-    print_status(false, "TCP socket set SO_REUSEADDR failed");
+  server_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (server_fd == ENCOS_INVALID_SOCKET) {
+    encos_socket_error("socket");
+    print_status(false, "TCP socket create failed");
+    encos_net_cleanup();
     return 1;
+  }
+
+  {
+    int opt = 1;
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt,
+                   sizeof(opt)) < 0) {
+      encos_socket_error("setsockopt");
+      encos_close_socket(server_fd);
+      encos_net_cleanup();
+      print_status(false, "TCP socket set SO_REUSEADDR failed");
+      return 1;
+    }
   }
 
   struct sockaddr_in addr;
@@ -87,22 +94,25 @@ int main(int argc, char **argv) {
   addr.sin_family = AF_INET;
   if (inet_pton(AF_INET, bind_ip, &addr.sin_addr) != 1) {
     fprintf(stderr, "Invalid IP address: %s\n", bind_ip);
-    close(server_fd);
+    encos_close_socket(server_fd);
+    encos_net_cleanup();
     print_status(false, "Invalid TCP bind IP");
     return 1;
   }
   addr.sin_port = htons(SERVER_PORT);
 
   if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-    perror("bind");
-    close(server_fd);
+    encos_socket_error("bind");
+    encos_close_socket(server_fd);
+    encos_net_cleanup();
     print_status(false, "TCP bind failed");
     return 1;
   }
 
   if (listen(server_fd, 8) < 0) {
-    perror("listen");
-    close(server_fd);
+    encos_socket_error("listen");
+    encos_close_socket(server_fd);
+    encos_net_cleanup();
     print_status(false, "TCP listen failed");
     return 1;
   }
@@ -113,11 +123,11 @@ int main(int argc, char **argv) {
 
   while (1) {
     struct sockaddr_in client_addr;
-    socklen_t client_len = sizeof(client_addr);
-    int client_fd =
+    encos_socklen_t client_len = sizeof(client_addr);
+    encos_socket_t client_fd =
         accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
-    if (client_fd < 0) {
-      perror("accept");
+    if (client_fd == ENCOS_INVALID_SOCKET) {
+      encos_socket_error("accept");
       continue;
     }
 
@@ -128,7 +138,7 @@ int main(int argc, char **argv) {
 
     while (1) {
       uint8_t raw[MAX_PACKET_SIZE] = {0};
-      ssize_t n = recv(client_fd, raw, sizeof(raw), 0);
+      encos_ssize_t n = recv(client_fd, (char *)raw, sizeof(raw), 0);
       if (n <= 0) {
         printf("TCP client disconnected\n");
         break;
@@ -138,7 +148,7 @@ int main(int argc, char **argv) {
       RawMotorFrame frames[MAX_MOTORS] = {0};
       count = parse_motor_batch(raw, (size_t)n, frames, MAX_MOTORS);
 
-      printf("Received TCP batch (%zd bytes), %zu frame(s)\n", (size_t)n,
+      printf("Received TCP batch (%lld bytes), %zu frame(s)\n", (long long)n,
              count);
       if (count == 0) {
         printf("No complete frame parsed\n");
@@ -150,9 +160,10 @@ int main(int argc, char **argv) {
       }
     }
 
-    close(client_fd);
+    encos_close_socket(client_fd);
   }
 
-  close(server_fd);
+  encos_close_socket(server_fd);
+  encos_net_cleanup();
   return 0;
 }
