@@ -1,3 +1,5 @@
+#include <QAbstractItemView>
+#include <QAbstractSpinBox>
 #include <QApplication>
 #include <QCheckBox>
 #include <QComboBox>
@@ -10,6 +12,7 @@
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QKeySequence>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMainWindow>
@@ -20,6 +23,7 @@
 #include <QPushButton>
 #include <QSettings>
 #include <QScrollArea>
+#include <QShortcut>
 #include <QSocketNotifier>
 #include <QSpinBox>
 #include <QTableWidget>
@@ -52,6 +56,19 @@ extern "C" {
 }
 
 namespace {
+
+bool isArrowKeyEditingWidget(const QWidget* focused) {
+    for (const QWidget* widget = focused; widget; widget = widget->parentWidget()) {
+        if (qobject_cast<const QAbstractSpinBox*>(widget) ||
+            qobject_cast<const QLineEdit*>(widget) ||
+            qobject_cast<const QComboBox*>(widget) ||
+            qobject_cast<const QAbstractItemView*>(widget) ||
+            qobject_cast<const QTextEdit*>(widget)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 struct MotorEntry {
     int id = 0;
@@ -934,18 +951,30 @@ private:
         auto* dpadLayout = new QGridLayout(dpad);
         dpadLayout->setContentsMargins(4, 0, 4, 0);
         dpadLayout->setSpacing(2);
-        const auto createArrowButton = [dpad](Qt::ArrowType direction, const QString& name) {
+        const auto createArrowButton = [dpad](Qt::ArrowType direction, const QString& name,
+                                             Qt::Key key) {
             auto* button = new QToolButton(dpad);
             button->setArrowType(direction);
             button->setFixedSize(38, 38);
+            const QKeySequence keySequence(key);
             button->setToolTip(name);
             button->setAccessibleName(name);
+
+            auto* shortcut = new QShortcut(keySequence, button);
+            shortcut->setContext(Qt::WindowShortcut);
+            shortcut->setAutoRepeat(false);
+            shortcut->setEnabled(!isArrowKeyEditingWidget(QApplication::focusWidget()));
+            connect(qApp, &QApplication::focusChanged, shortcut,
+                    [shortcut](QWidget*, QWidget* focused) {
+                        shortcut->setEnabled(!isArrowKeyEditingWidget(focused));
+                    });
+            connect(shortcut, &QShortcut::activated, button, &QToolButton::click);
             return button;
         };
-        auto* arrowUpButton = createArrowButton(Qt::UpArrow, "Up");
-        auto* arrowDownButton = createArrowButton(Qt::DownArrow, "Down");
-        auto* arrowLeftButton = createArrowButton(Qt::LeftArrow, "Left");
-        auto* arrowRightButton = createArrowButton(Qt::RightArrow, "Right");
+        auto* arrowUpButton = createArrowButton(Qt::UpArrow, "Up", Qt::Key_Up);
+        auto* arrowDownButton = createArrowButton(Qt::DownArrow, "Down", Qt::Key_Down);
+        auto* arrowLeftButton = createArrowButton(Qt::LeftArrow, "Left", Qt::Key_Left);
+        auto* arrowRightButton = createArrowButton(Qt::RightArrow, "Right", Qt::Key_Right);
         dpadLayout->addWidget(arrowUpButton, 0, 1);
         dpadLayout->addWidget(arrowLeftButton, 1, 0);
         dpadLayout->addWidget(arrowRightButton, 1, 2);
