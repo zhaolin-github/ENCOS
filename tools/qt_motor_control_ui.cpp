@@ -5,6 +5,7 @@
 #include <QComboBox>
 #include <QDateTime>
 #include <QDoubleSpinBox>
+#include <QElapsedTimer>
 #include <QFileDialog>
 #include <QFontDatabase>
 #include <QFormLayout>
@@ -13,6 +14,9 @@
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QKeySequence>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMainWindow>
@@ -155,6 +159,62 @@ std::array<uint8_t, 7> encodeSpeedCommand(float speed) {
              0x64}};
 }
 
+float decodeFloatBits(uint32_t bits) {
+    float value = 0.0f;
+    std::memcpy(&value, &bits, sizeof(value));
+    return std::isfinite(value) ? value : 0.0f;
+}
+
+double commandSpeed(const MotorEntry& motor) {
+    if (motor.commandName != "spd") {
+        return 0.0;
+    }
+    if (!motor.rawPayloadManual) {
+        return motor.param1;
+    }
+    if (motor.rawDataLen < 5 || motor.rawData[0] != 0x41) {
+        return 0.0;
+    }
+    const uint32_t bits = (static_cast<uint32_t>(motor.rawData[1]) << 24) |
+                          (static_cast<uint32_t>(motor.rawData[2]) << 16) |
+                          (static_cast<uint32_t>(motor.rawData[3]) << 8) | motor.rawData[4];
+    return decodeFloatBits(bits);
+}
+
+double commandPosition(const MotorEntry& motor) {
+    if (motor.commandName != "pos") {
+        return 0.0;
+    }
+    if (!motor.rawPayloadManual) {
+        return motor.param1;
+    }
+    if (motor.rawDataLen < 8 || (motor.rawData[0] >> 5) != 1) {
+        return 0.0;
+    }
+    uint64_t frame = 0;
+    for (uint8_t byte : motor.rawData) {
+        frame = (frame << 8) | byte;
+    }
+    return decodeFloatBits(static_cast<uint32_t>((frame >> 29) & 0xFFFFFFFFu));
+}
+
+double commandPositionSpeed(const MotorEntry& motor) {
+    if (motor.commandName != "pos") {
+        return 0.0;
+    }
+    if (!motor.rawPayloadManual) {
+        return motor.param2;
+    }
+    if (motor.rawDataLen < 8 || (motor.rawData[0] >> 5) != 1) {
+        return 0.0;
+    }
+    uint64_t frame = 0;
+    for (uint8_t byte : motor.rawData) {
+        frame = (frame << 8) | byte;
+    }
+    return static_cast<double>((frame >> 14) & 0x7FFFu) / 10.0;
+}
+
 enum class TransportMode {
     UdpCan,
     TcpTcp,
@@ -292,7 +352,11 @@ public:
           autoSendTimer_(new QTimer(this)),
           networkCheckTimer_(new QTimer(this)),
           calibrationTimer_(new QTimer(this)),
+          jsonTimer_(new QTimer(this)),
+          jsonDeadlineTimer_(new QTimer(this)),
+          jsonBlinkTimer_(new QTimer(this)),
           udpSocket_(new QUdpSocket(this)),
+          jsonSocket_(new QUdpSocket(this)),
           tcpSocket_(new QTcpSocket(this)),
           canSocket_(-1) {
         setWindowTitle("Robot Motor Control Dashboard");
@@ -308,6 +372,15 @@ public:
         connect(calibrationTimer_, &QTimer::timeout, this,
                 &MotorControlWindow::onCalibrationTimeout);
         connect(udpSocket_, &QUdpSocket::readyRead, this, &MotorControlWindow::onUdpReadyRead);
+        connect(jsonTimer_, &QTimer::timeout, this, &MotorControlWindow::sendJsonDatagram);
+        jsonDeadlineTimer_->setSingleShot(true);
+        connect(jsonDeadlineTimer_, &QTimer::timeout, this, &MotorControlWindow::stopJsonBroadcast);
+        connect(jsonBlinkTimer_, &QTimer::timeout, this, [this]() {
+            jsonBlinkOn_ = !jsonBlinkOn_;
+            jsonSendButton_->setStyleSheet(jsonBlinkOn_ ?
+                "background-color: #32b85a; color: white;" :
+                "background-color: #ffc344; color: black;");
+        });
         connect(tcpSocket_, &QTcpSocket::readyRead, this, &MotorControlWindow::onTcpReadyRead);
         frameTimer_->start(500);
         feedbackTimer_->start(1000);
@@ -1025,10 +1098,66 @@ private:
 
         auto* frameGroup = new QGroupBox("Command Frame Preview (0.5s refresh)", this);
         auto* frameLayout = new QVBoxLayout(frameGroup);
+        auto* jsonControls = new QHBoxLayout();
+        jsonHostEdit_ = new QLineEdit("255.255.255.255", frameGroup);
+        jsonHostEdit_->setToolTip("IPv4 unicast, broadcast, or multicast destination");
+        jsonPortEdit_ = new QSpinBox(frameGroup);
+        jsonPortEdit_->setRange(1, 65535);
+        jsonPortEdit_->setValue(5001);
+        jsonDurationEdit_ = new QDoubleSpinBox(frameGroup);
+        jsonDurationEdit_->setRange(0.0, 86400.0);
+        jsonDurationEdit_->setDecimals(1);
+        jsonDurationEdit_->setSuffix(" s");
+        jsonDurationEdit_->setToolTip("0 sends continuously until stopped");
+        jsonRateEdit_ = new QComboBox(frameGroup);
+        for (int hz : {1, 5, 10, 20}) {
+            jsonRateEdit_->addItem(QString("%1 Hz").arg(hz), hz);
+        }
+        jsonRateEdit_->setCurrentIndex(2);
+        jsonSendButton_ = new QPushButton("Start JSON UDP", frameGroup);
+        jsonSendButton_->setCheckable(true);
+        connect(jsonSendButton_, &QPushButton::clicked, this, [this](bool checked) {
+            if (checked) {
+                startJsonBroadcast();
+            } else {
+                stopJsonBroadcast();
+            }
+        });
+        jsonControls->addWidget(new QLabel("JSON UDP:", frameGroup));
+        jsonControls->addWidget(jsonHostEdit_, 2);
+        jsonControls->addWidget(jsonPortEdit_);
+        jsonControls->addWidget(jsonDurationEdit_);
+        jsonControls->addWidget(jsonRateEdit_);
+        jsonControls->addWidget(jsonSendButton_);
+        frameLayout->addLayout(jsonControls);
+        auto* jsonInterfaceControls = new QHBoxLayout();
+        jsonInterfaceEdit_ = new QComboBox(frameGroup);
+        jsonInterfaceEdit_->addItem("Auto (system route)", "");
+        for (const QNetworkInterface& iface : QNetworkInterface::allInterfaces()) {
+            if (!(iface.flags() & QNetworkInterface::IsUp) ||
+                (iface.flags() & QNetworkInterface::IsLoopBack)) {
+                continue;
+            }
+            for (const QNetworkAddressEntry& entry : iface.addressEntries()) {
+                if (entry.ip().protocol() == QAbstractSocket::IPv4Protocol) {
+                    jsonInterfaceEdit_->addItem(
+                        QString("%1 (%2)").arg(iface.humanReadableName(), entry.ip().toString()),
+                        entry.ip().toString());
+                }
+            }
+        }
+        jsonInterfaceControls->addWidget(new QLabel("Outgoing interface:", frameGroup));
+        jsonInterfaceControls->addWidget(jsonInterfaceEdit_, 1);
+        frameLayout->addLayout(jsonInterfaceControls);
+        jsonText_ = new QTextEdit(frameGroup);
+        jsonText_->setReadOnly(true);
+        jsonText_->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+        jsonText_->setMinimumHeight(80);
+        frameLayout->addWidget(jsonText_, 1);
         frameText_ = new QTextEdit(this);
         frameText_->setReadOnly(true);
         frameText_->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
-        frameLayout->addWidget(frameText_);
+        frameLayout->addWidget(frameText_, 2);
 
         auto* feedbackGroup = new QGroupBox("8 Motor Feedback Data (1s refresh)", this);
         auto* feedbackLayout = new QVBoxLayout(feedbackGroup);
@@ -1096,6 +1225,121 @@ private:
                 const QByteArray slice = currentFrame.mid(i, bytesPerFrame);
                 frameText_->append(packetToText(slice));
             }
+        }
+        const QString jsonPreview = QString::fromUtf8(buildJsonCommand().toJson(QJsonDocument::Indented));
+        if (jsonText_->toPlainText() != jsonPreview) {
+            jsonText_->setPlainText(jsonPreview);
+        }
+    }
+
+    QJsonDocument buildJsonCommand() const {
+        QJsonArray fields;
+        const auto add = [&fields](int id, const QString& name, const QString& unit,
+                                   const QString& value) {
+            QJsonObject field;
+            field.insert("id", id);
+            field.insert("name", name);
+            field.insert("remark", "");
+            field.insert("unit", unit);
+            field.insert("value", value);
+            fields.append(field);
+        };
+        const auto number = [](double value) { return QString::number(value, 'f', 3); };
+        const auto direction = [](double value) {
+            if (std::fabs(value) < 0.0005) {
+                return QString("stable");
+            }
+            return value > 0.0 ? QString("正转") : QString("反转");
+        };
+        add(1, "指令执行时长", "s", number(jsonDurationEdit_->value()));
+        const std::array<int, 4> driveIds = {{7, 1, 5, 3}};
+        const std::array<QString, 4> wheels = {{"左前轮", "右前轮", "左后轮", "右后轮"}};
+        for (int i = 0; i < 4; ++i) {
+            const MotorEntry& motor = motorList_[driveIds[i] - 1];
+            const double speed = motor.enabled ? commandSpeed(motor) : 0.0;
+            add(2 + i * 2, wheels[i] + "行进电机方向", "", direction(speed));
+            add(3 + i * 2, wheels[i] + "行进电机速度", "rpm", number(speed));
+        }
+        const std::array<int, 4> steeringIds = {{8, 2, 6, 4}};
+        for (int i = 0; i < 4; ++i) {
+            const MotorEntry& motor = motorList_[steeringIds[i] - 1];
+            const double angle = motor.enabled ? commandPosition(motor) : 0.0;
+            const double speed = motor.enabled ? commandPositionSpeed(motor) : 0.0;
+            add(10 + i * 4, wheels[i] + "转向电机方向", "", direction(angle));
+            add(11 + i * 4, wheels[i] + "转向控制模式", "", "旋变控制");
+            add(12 + i * 4, wheels[i] + "转向电机速度", "rpm", number(speed));
+            add(13 + i * 4, wheels[i] + "转向电机目标角度", "°", number(angle));
+        }
+        return QJsonDocument(fields);
+    }
+
+    void startJsonBroadcast() {
+        const QHostAddress address(jsonHostEdit_->text().trimmed());
+        if (address.isNull() || address.protocol() != QAbstractSocket::IPv4Protocol) {
+            stopJsonBroadcast();
+            QMessageBox::warning(this, "JSON UDP", "Enter a valid IPv4 destination address.");
+            return;
+        }
+        jsonSocket_->close();
+        const QString sourceIp = jsonInterfaceEdit_->currentData().toString();
+        if (!sourceIp.isEmpty() &&
+            !jsonSocket_->bind(QHostAddress(sourceIp), 0)) {
+            const QString error = jsonSocket_->errorString();
+            stopJsonBroadcast();
+            QMessageBox::warning(this, "JSON UDP",
+                                 QString("Cannot use outgoing address %1: %2").arg(sourceIp, error));
+            return;
+        }
+        jsonAddress_ = address;
+        jsonDestinationPort_ = static_cast<quint16>(jsonPortEdit_->value());
+        jsonHostEdit_->setEnabled(false);
+        jsonPortEdit_->setEnabled(false);
+        jsonDurationEdit_->setEnabled(false);
+        jsonRateEdit_->setEnabled(false);
+        jsonInterfaceEdit_->setEnabled(false);
+        jsonSendButton_->setText("Stop JSON UDP");
+        jsonElapsed_.start();
+        if (jsonDurationEdit_->value() > 0.0) {
+            jsonDeadlineTimer_->start(static_cast<int>(std::ceil(jsonDurationEdit_->value() * 1000.0)));
+        }
+        jsonBlinkTimer_->start(300);
+        sendJsonDatagram();
+        if (jsonSendButton_->isChecked()) {
+            jsonTimer_->start(1000 / jsonRateEdit_->currentData().toInt());
+        }
+    }
+
+    void stopJsonBroadcast() {
+        jsonTimer_->stop();
+        jsonDeadlineTimer_->stop();
+        jsonBlinkTimer_->stop();
+        jsonBlinkOn_ = false;
+        jsonSendButton_->setChecked(false);
+        jsonSendButton_->setText("Start JSON UDP");
+        jsonSendButton_->setStyleSheet("");
+        jsonHostEdit_->setEnabled(true);
+        jsonPortEdit_->setEnabled(true);
+        jsonDurationEdit_->setEnabled(true);
+        jsonRateEdit_->setEnabled(true);
+        jsonInterfaceEdit_->setEnabled(true);
+    }
+
+    void sendJsonDatagram() {
+        if (jsonDurationEdit_->value() > 0.0 &&
+            jsonElapsed_.elapsed() >= static_cast<qint64>(jsonDurationEdit_->value() * 1000.0)) {
+            stopJsonBroadcast();
+            return;
+        }
+        const QByteArray payload = buildJsonCommand().toJson(QJsonDocument::Compact);
+        const qint64 sent = jsonSocket_->writeDatagram(payload, jsonAddress_, jsonDestinationPort_);
+        if (sent != payload.size()) {
+            const QString error = jsonSocket_->errorString();
+            stopJsonBroadcast();
+            QMessageBox::warning(this, "JSON UDP",
+                                 QString("Failed to send JSON datagram to %1:%2 via %3: %4")
+                                     .arg(jsonAddress_.toString())
+                                     .arg(jsonDestinationPort_)
+                                     .arg(jsonInterfaceEdit_->currentText(), error));
         }
     }
 
@@ -1715,6 +1959,13 @@ private:
     QPushButton* saveButton_ = nullptr;
     QPushButton* connectButton_ = nullptr;
     QTextEdit* frameText_ = nullptr;
+    QTextEdit* jsonText_ = nullptr;
+    QLineEdit* jsonHostEdit_ = nullptr;
+    QSpinBox* jsonPortEdit_ = nullptr;
+    QDoubleSpinBox* jsonDurationEdit_ = nullptr;
+    QComboBox* jsonRateEdit_ = nullptr;
+    QComboBox* jsonInterfaceEdit_ = nullptr;
+    QPushButton* jsonSendButton_ = nullptr;
     QTableWidget* feedbackTable_ = nullptr;
     QWidget* rightPanel_ = nullptr;
     QLabel* localIpLabel_ = nullptr;
@@ -1728,7 +1979,11 @@ private:
     QTimer* autoSendTimer_ = nullptr;
     QTimer* networkCheckTimer_ = nullptr;
     QTimer* calibrationTimer_ = nullptr;
+    QTimer* jsonTimer_ = nullptr;
+    QTimer* jsonDeadlineTimer_ = nullptr;
+    QTimer* jsonBlinkTimer_ = nullptr;
     QUdpSocket* udpSocket_ = nullptr;
+    QUdpSocket* jsonSocket_ = nullptr;
     QTcpSocket* tcpSocket_ = nullptr;
     QSocketNotifier* canReadNotifier_ = nullptr;
     QToolButton* calibrationButton_ = nullptr;
@@ -1738,6 +1993,10 @@ private:
     bool networkConnected_ = false;
     bool calibrationActive_ = false;
     bool calibrationResumeAutoSend_ = false;
+    bool jsonBlinkOn_ = false;
+    QElapsedTimer jsonElapsed_;
+    QHostAddress jsonAddress_;
+    quint16 jsonDestinationPort_ = 0;
 };
 
 int main(int argc, char** argv) {
